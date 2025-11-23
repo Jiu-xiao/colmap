@@ -31,6 +31,7 @@
 
 #include "colmap/ui/main_window.h"
 
+#include <iostream>
 #include <set>
 
 #define SELECTION_BUFFER_IMAGE_IDX 0
@@ -1009,14 +1010,19 @@ void ModelViewerWidget::UploadCoordinateGridData() {
 void ModelViewerWidget::UploadPointData(const bool selection_mode) {
   makeCurrent();
 
+  std::cout << "[ModelViewerWidget] UploadPointData(selection_mode="
+            << selection_mode << "), points3D=" << points3D.size()
+            << ", external_points_=" << external_points_.size() << std::endl;
+
   std::vector<PointPainter::Data> data;
 
-  // Assume we want to display the majority of points
-  data.reserve(points3D.size());
+  // 容量：重建点 + 外部点云
+  data.reserve(points3D.size() + external_points_.size());
 
   const size_t min_track_len =
       static_cast<size_t>(options_->render->min_track_len);
 
+  // 没有选中任何 image
   if (selected_image_id_ == kInvalidImageId &&
       images.count(selected_image_id_) == 0) {
     for (const auto& [point3D_id, point3D] : points3D) {
@@ -1031,7 +1037,6 @@ void ModelViewerWidget::UploadPointData(const bool selection_mode) {
           selection_buffer_.push_back(
               std::make_pair(point3D_id, SELECTION_BUFFER_POINT_IDX));
           color = IndexToRGB(index);
-
         } else if (point3D_id == selected_point3D_id_) {
           color = kSelectedPointColor;
         } else {
@@ -1042,7 +1047,7 @@ void ModelViewerWidget::UploadPointData(const bool selection_mode) {
             xyz(0), xyz(1), xyz(2), color(0), color(1), color(2), color(3));
       }
     }
-  } else {  // Image selected
+  } else {  // 选中了某个 image
     const auto& selected_image = images[selected_image_id_];
     for (const auto& [point3D_id, point3D] : points3D) {
       if (point3D.error <= options_->render->max_error &&
@@ -1070,7 +1075,23 @@ void ModelViewerWidget::UploadPointData(const bool selection_mode) {
     }
   }
 
+  // 追加外部点云
+  // 不参与 selection_mode 的 picking，只在正常渲染时显示
+  if (!selection_mode && !external_points_.empty()) {
+    for (const auto& p : external_points_) {
+      // 和重建点一样应用 origin/scale，保证在同一坐标系
+      Eigen::Vector3f xyz =
+          (model_scale_ * (p.cast<double>() + model_origin_)).cast<float>();
+
+      const float r = 0.0f, g = 1.0f, b = 0.0f, a = 0.4f;  // 亮绿色
+      data.emplace_back(xyz(0), xyz(1), xyz(2), r, g, b, a);
+    }
+  }
+
   point_painter_.Upload(data);
+
+  std::cout << "[ModelViewerWidget] UploadPointData: uploaded " << data.size()
+            << " vertices" << std::endl;
 }
 
 void ModelViewerWidget::UploadPointConnectionData() {
@@ -1367,6 +1388,15 @@ Eigen::Vector3f ModelViewerWidget::PositionToArcballVector(
     vec = vec.normalized();
   }
   return vec;
+}
+
+void ModelViewerWidget::SetExternalPointCloud(
+    const std::vector<Eigen::Vector3f>& points) {
+  std::cout << "[ModelViewerWidget] SetExternalPointCloud with "
+            << points.size() << " points" << std::endl;
+  external_points_ = points;
+  UploadPointData();  // 重新上传点数据（包括 external_points_）
+  update();           // 触发重绘
 }
 
 }  // namespace colmap

@@ -44,6 +44,9 @@
 #include <QOpenGLFunctions_3_2_Core>
 #include <QtCore>
 #include <QtOpenGL>
+#include <vector>
+
+#include <Eigen/Core>
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
 #include <QOpenGLWidget>
 #endif
@@ -79,6 +82,8 @@ class ModelViewerWidget : public QOpenGLWidget,
   void ClearReconstruction();
 
   int GetProjectionType() const;
+
+  void SetExternalPointCloud(const std::vector<Eigen::Vector3f>& points);
 
   // Takes ownwership of the colormap objects.
   void SetPointColormap(PointColormapBase* colormap);
@@ -160,6 +165,8 @@ class ModelViewerWidget : public QOpenGLWidget,
   float OrthographicWindowExtent() const;
 
   Eigen::Vector3f PositionToArcballVector(float x, float y) const;
+
+  std::vector<Eigen::Vector3f> external_points_;
 
   OptionManager* options_;
 

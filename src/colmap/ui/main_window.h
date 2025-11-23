@@ -55,7 +55,16 @@
 #include <QtWidgets>
 #include <memory>
 
+#include <Eigen/Core>
+#include <Eigen/Geometry>
+
 namespace colmap {
+
+struct LidarPose {
+  Eigen::Quaterniond q;    // 旋转
+  Eigen::Vector3d t;       // 平移
+  std::string image_name;  // 对应的图像名
+};
 
 class MainWindow : public QMainWindow {
  public:
@@ -144,6 +153,10 @@ class MainWindow : public QMainWindow {
 
   void UpdateWindowTitle();
 
+  void LoadPointMap();
+  void LoadLidarPoses();
+  void RunLidarBundleAdjustment();
+
   OptionManager options_;
 
   std::shared_ptr<ReconstructionManager> reconstruction_manager_;
@@ -223,6 +236,9 @@ class MainWindow : public QMainWindow {
   QAction* action_grab_movie_;
   QAction* action_undistort_;
   QAction* action_extract_colors_;
+  QAction* action_load_pointmap_;
+  QAction* action_load_lidar_poses_;
+  QAction* action_lidar_bundle_adjustment_;
   QAction* action_set_options_;
   QAction* action_reset_options_;
   QAction* action_set_log_level_;
@@ -236,6 +252,9 @@ class MainWindow : public QMainWindow {
 
   // Necessary for OS X to avoid duplicate closeEvents.
   bool window_closed_;
+
+  std::vector<Eigen::Vector3f> lidar_points_;
+  std::vector<LidarPose> lidar_poses_;
 };
 
 }  // namespace colmap

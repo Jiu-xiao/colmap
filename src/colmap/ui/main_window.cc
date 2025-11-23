@@ -38,6 +38,12 @@
 #include <QSettings>
 #include <QStandardPaths>
 #include <clocale>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+
+#include <ceres/ceres.h>
 
 namespace {
 
@@ -91,6 +97,124 @@ void SetLastOpen(const QString& key, const QString& pathOrDir) {
   s.setValue(key, dir);
   s.setValue(kLastGlobalDir, dir);
   s.endGroup();
+}
+
+// ===== LiDAR BA helper structs & functions =====
+struct LidarBaOptions {
+  double translation_prior_sigma = 1.0;   // 平移先验 sigma
+  double translation_smooth_sigma = 0.5;  // 相邻平滑项 sigma
+  bool fix_first_pose = true;             // 是否固定第一帧
+  int max_num_iterations = 50;
+};
+
+// 平移先验损失：约束 t_i ≈ t0_i
+struct TranslationPriorCost {
+  TranslationPriorCost(const Eigen::Vector3d& t0, double weight)
+      : t0_(t0), weight_(weight) {}
+
+  template <typename T>
+  bool operator()(const T* const t, T* residuals) const {
+    residuals[0] = T(weight_) * (t[0] - T(t0_(0)));
+    residuals[1] = T(weight_) * (t[1] - T(t0_(1)));
+    residuals[2] = T(weight_) * (t[2] - T(t0_(2)));
+    return true;
+  }
+
+  Eigen::Vector3d t0_;
+  double weight_;
+};
+
+// 相邻两帧平滑：约束 (t_j - t_i) ≈ dt0_ij
+struct TranslationSmoothnessCost {
+  TranslationSmoothnessCost(const Eigen::Vector3d& dt0, double weight)
+      : dt0_(dt0), weight_(weight) {}
+
+  template <typename T>
+  bool operator()(const T* const ti, const T* const tj, T* residuals) const {
+    residuals[0] = T(weight_) * ((tj[0] - ti[0]) - T(dt0_(0)));
+    residuals[1] = T(weight_) * ((tj[1] - ti[1]) - T(dt0_(1)));
+    residuals[2] = T(weight_) * ((tj[2] - ti[2]) - T(dt0_(2)));
+    return true;
+  }
+
+  Eigen::Vector3d dt0_;
+  double weight_;
+};
+
+void RunLidarBundleAdjustmentImpl(
+    const std::vector<colmap::LidarPose>& input_poses,
+    const LidarBaOptions& ba_options,
+    std::vector<colmap::LidarPose>* output_poses) {
+  output_poses->clear();
+
+  if (input_poses.size() < 2) {
+    std::cout << "[LidarBA] Not enough poses, skip BA." << std::endl;
+    return;
+  }
+
+  const size_t N = input_poses.size();
+  output_poses->assign(input_poses.begin(), input_poses.end());
+
+  // 拷贝平移作为变量和先验
+  std::vector<Eigen::Vector3d> t_orig(N);
+  std::vector<Eigen::Vector3d> t_opt(N);
+  for (size_t i = 0; i < N; ++i) {
+    t_orig[i] = input_poses[i].t;
+    t_opt[i] = input_poses[i].t;
+  }
+
+  ceres::Problem problem;
+
+  for (size_t i = 0; i < N; ++i) {
+    problem.AddParameterBlock(t_opt[i].data(), 3);
+  }
+
+  if (ba_options.fix_first_pose) {
+    problem.SetParameterBlockConstant(t_opt[0].data());
+  }
+
+  const double w_prior = 1.0 / ba_options.translation_prior_sigma;
+  const double w_smooth = 1.0 / ba_options.translation_smooth_sigma;
+
+  // 每个 pose 的平移先验
+  for (size_t i = 0; i < N; ++i) {
+    ceres::CostFunction* cost =
+        new ceres::AutoDiffCostFunction<TranslationPriorCost, 3, 3>(
+            new TranslationPriorCost(t_orig[i], w_prior));
+    problem.AddResidualBlock(cost, nullptr, t_opt[i].data());
+  }
+
+  // 相邻 pose 间平滑项
+  for (size_t i = 0; i + 1 < N; ++i) {
+    const Eigen::Vector3d dt0 = t_orig[i + 1] - t_orig[i];
+    ceres::CostFunction* cost =
+        new ceres::AutoDiffCostFunction<TranslationSmoothnessCost, 3, 3, 3>(
+            new TranslationSmoothnessCost(dt0, w_smooth));
+    problem.AddResidualBlock(
+        cost, nullptr, t_opt[i].data(), t_opt[i + 1].data());
+  }
+
+  ceres::Solver::Options solver_options;
+  solver_options.max_num_iterations = ba_options.max_num_iterations;
+  solver_options.linear_solver_type = ceres::DENSE_QR;
+  solver_options.minimizer_progress_to_stdout = true;
+
+  ceres::Solver::Summary summary;
+  ceres::Solve(solver_options, &problem, &summary);
+
+  std::cout << "[LidarBA] Summary: " << summary.BriefReport() << std::endl;
+
+  if (!summary.IsSolutionUsable()) {
+    std::cout << "[LidarBA] Solution not usable, keep original poses."
+              << std::endl;
+    output_poses->clear();  // 用 clear 作为失败信号
+    return;
+  }
+
+  // 写回平移（旋转先不动）
+  for (size_t i = 0; i < N; ++i) {
+    (*output_poses)[i].t = t_opt[i];
+  }
 }
 
 }  // anonymous namespace
@@ -483,6 +607,25 @@ void MainWindow::CreateActions() {
           this,
           &MainWindow::ExtractColors);
 
+  action_load_pointmap_ =
+      new QAction(QIcon(":/media/import.png"), tr("Load PointMap"), this);
+  connect(action_load_pointmap_,
+          &QAction::triggered,
+          this,
+          &MainWindow::LoadPointMap);
+  action_load_lidar_poses_ = new QAction(tr("Load LiDAR poses"), this);
+  connect(action_load_lidar_poses_,
+          &QAction::triggered,
+          this,
+          &MainWindow::LoadLidarPoses);
+
+  action_lidar_bundle_adjustment_ =
+      new QAction(tr("Run LiDAR bundle adjustment"), this);
+  connect(action_lidar_bundle_adjustment_,
+          &QAction::triggered,
+          this,
+          &MainWindow::RunLidarBundleAdjustment);
+
   action_set_options_ = new QAction(tr("Set options for ..."), this);
   connect(
       action_set_options_, &QAction::triggered, this, &MainWindow::SetOptions);
@@ -596,6 +739,9 @@ void MainWindow::CreateMenus() {
   extras_menu->addSeparator();
   extras_menu->addAction(action_undistort_);
   extras_menu->addAction(action_extract_colors_);
+  extras_menu->addAction(action_load_pointmap_);
+  extras_menu->addAction(action_load_lidar_poses_);
+  extras_menu->addAction(action_lidar_bundle_adjustment_);
   extras_menu->addSeparator();
   extras_menu->addAction(action_set_options_);
   extras_menu->addAction(action_reset_options_);
@@ -654,6 +800,8 @@ void MainWindow::CreateToolbar() {
   extras_toolbar_->addAction(action_reconstruction_stats_);
   extras_toolbar_->addAction(action_grab_image_);
   extras_toolbar_->addAction(action_grab_movie_);
+  extras_toolbar_->addAction(action_load_pointmap_);
+  extras_toolbar_->addAction(action_load_lidar_poses_);
   extras_toolbar_->setIconSize(QSize(16, 16));
 }
 
@@ -1392,9 +1540,7 @@ void MainWindow::ExtractColors() {
 
 void MainWindow::SetOptions() {
   QStringList data_items;
-  data_items << "Individual images"
-             << "Video frames"
-             << "Internet images";
+  data_items << "Individual images" << "Video frames" << "Internet images";
   bool data_ok = false;
   const QString data_item =
       QInputDialog::getItem(this, "", "Data:", data_items, 0, false, &data_ok);
@@ -1403,10 +1549,7 @@ void MainWindow::SetOptions() {
   }
 
   QStringList quality_items;
-  quality_items << "Low"
-                << "Medium"
-                << "High"
-                << "Extreme";
+  quality_items << "Low" << "Medium" << "High" << "Extreme";
   bool quality_ok = false;
   const QString quality_item = QInputDialog::getItem(
       this, "", "Quality:", quality_items, 2, false, &quality_ok);
@@ -1532,6 +1675,220 @@ void MainWindow::UpdateWindowTitle() {
     }
     setWindowTitle(QString::fromStdString("COLMAP - " + project_title));
   }
+}
+
+void MainWindow::LoadPointMap() {
+  // 选取点云文件
+  const QString default_path = GetLastOpen(kLastImportExport);
+  const QString path =
+      QFileDialog::getOpenFileName(this,
+                                   tr("Select point cloud"),
+                                   default_path,
+                                   tr("Point cloud (*.pcd);;All files (*)"));
+
+  if (path.isEmpty()) {
+    return;  // 用户取消
+  }
+
+  SetLastOpen(kLastImportExport, path);
+
+  // 用 binary 模式打开
+  std::ifstream in(path.toStdString(), std::ios::binary);
+  if (!in) {
+    QMessageBox::critical(
+        this, tr("Load PointMap"), tr("Failed to open file:\n%1").arg(path));
+    return;
+  }
+
+  std::string line;
+  std::size_t num_points = 0;
+  bool is_ascii = false;
+  bool is_binary = false;
+
+  // 记录 DATA 行的类型，并读 POINTS
+  while (std::getline(in, line)) {
+    if (line.rfind("POINTS", 0) == 0) {
+      std::istringstream iss(line.substr(std::strlen("POINTS")));
+      iss >> num_points;
+    } else if (line.rfind("DATA", 0) == 0) {
+      if (line.find("ascii") != std::string::npos) {
+        is_ascii = true;
+      } else if (line.find("binary") != std::string::npos) {
+        is_binary = true;
+      } else if (line.find("binary_compressed") != std::string::npos) {
+        // 不支持压缩版本
+        QMessageBox::critical(
+            this,
+            tr("Load PointMap"),
+            tr("PCD files with 'DATA binary_compressed' are not supported.\n"
+               "Please convert them to 'binary' or 'ascii'."));
+        return;
+      }
+      // 读完 header，进入数据区
+      break;
+    }
+  }
+
+  if (num_points == 0) {
+    QMessageBox::critical(this,
+                          tr("Load PointMap"),
+                          tr("Failed to read PCD header (no POINTS field)."));
+    return;
+  }
+
+  lidar_points_.clear();
+  lidar_points_.reserve(num_points);
+
+  // FIELDS x y z intensity normal_x normal_y normal_z curvature
+  // float * 8
+  const std::size_t kNumFloatsPerPoint = 8;
+
+  if (is_ascii) {
+    float v[kNumFloatsPerPoint];
+    while (in >> v[0] >> v[1] >> v[2] >> v[3] >> v[4] >> v[5] >> v[6] >> v[7]) {
+      lidar_points_.emplace_back(v[0], v[1], v[2]);
+    }
+  } else if (is_binary) {
+    const std::size_t point_step = kNumFloatsPerPoint * sizeof(float);
+    std::vector<char> buffer(point_step);
+
+    for (std::size_t i = 0; i < num_points; ++i) {
+      in.read(buffer.data(), point_step);
+      if (!in) {
+        break;  // 读失败，退出
+      }
+      const float* f = reinterpret_cast<const float*>(buffer.data());
+      lidar_points_.emplace_back(f[0], f[1], f[2]);  // xyz
+    }
+  } else {
+    QMessageBox::critical(this,
+                          tr("Load PointMap"),
+                          tr("Unsupported PCD DATA type. Only 'ascii' and "
+                             "'binary' are supported."));
+    return;
+  }
+
+  if (lidar_points_.empty()) {
+    QMessageBox::critical(this,
+                          tr("Load PointMap"),
+                          tr("No points could be read from:\n%1").arg(path));
+    return;
+  }
+
+  std::cout << "[LoadPointMap] loaded " << lidar_points_.size()
+            << " points from " << path.toStdString() << std::endl;
+  const auto& p0 = lidar_points_.front();
+  std::cout << "[LoadPointMap] first point: " << p0.x() << " " << p0.y() << " "
+            << p0.z() << std::endl;
+
+  // 更新 3D viewer
+  model_viewer_widget_->SetExternalPointCloud(lidar_points_);
+}
+
+void MainWindow::LoadLidarPoses() {
+  const QString default_path = GetLastOpen(kLastImportExport);
+  const QString path = QFileDialog::getOpenFileName(
+      this,
+      tr("Select LiDAR poses (selected_raw_poses.txt)"),
+      default_path,
+      tr("Text files (*.txt);;All files (*)"));
+
+  if (path.isEmpty()) {
+    return;
+  }
+
+  SetLastOpen(kLastImportExport, path);
+
+  std::ifstream in(path.toStdString());
+  if (!in) {
+    QMessageBox::critical(
+        this, tr("Load LiDAR poses"), tr("Failed to open file:\n%1").arg(path));
+    return;
+  }
+
+  std::string header;
+  if (!std::getline(in, header)) {
+    QMessageBox::critical(
+        this, tr("Load LiDAR poses"), tr("Empty pose file:\n%1").arg(path));
+    return;
+  }
+
+  lidar_poses_.clear();
+
+  std::string image_name;
+  while (in >> image_name) {
+    double m[16];
+    for (int i = 0; i < 16; ++i) {
+      if (!(in >> m[i])) {
+        QMessageBox::critical(this,
+                              tr("Load LiDAR poses"),
+                              tr("Unexpected end of file when reading matrix "
+                                 "for %1")
+                                  .arg(QString::fromStdString(image_name)));
+        return;
+      }
+    }
+
+    Eigen::Matrix4d T;
+    T << m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10],
+        m[11], m[12], m[13], m[14], m[15];
+
+    // 旋转和平移
+    Eigen::Matrix3d R = T.block<3, 3>(0, 0);
+    Eigen::Vector3d t = T.block<3, 1>(0, 3);
+
+    LidarPose pose;
+    pose.q = Eigen::Quaterniond(R);
+    pose.t = t;
+    pose.image_name = image_name;
+
+    lidar_poses_.push_back(pose);
+  }
+
+  std::cout << "[LoadLidarPoses] loaded " << lidar_poses_.size()
+            << " poses from " << path.toStdString() << std::endl;
+  if (!lidar_poses_.empty()) {
+    const auto& p0 = lidar_poses_.front();
+    std::cout << "[LoadLidarPoses] first pose: image=" << p0.image_name
+              << " t=" << p0.t.transpose() << std::endl;
+  }
+}
+
+// ===== LiDAR BA entry point =====
+
+void MainWindow::RunLidarBundleAdjustment() {
+  if (lidar_poses_.size() < 2) {
+    QMessageBox::warning(this,
+                         tr("LiDAR bundle adjustment"),
+                         tr("No or too few LiDAR poses loaded.\n"
+                            "Please load LiDAR poses first."));
+    return;
+  }
+
+  //TODO: 从 UI 读参数
+  LidarBaOptions ba_options;
+  // ba_options.translation_prior_sigma = 1.0;
+  // ba_options.translation_smooth_sigma = 0.5;
+  // ba_options.fix_first_pose = true;
+
+  std::vector<LidarPose> optimized_poses;
+  RunLidarBundleAdjustmentImpl(lidar_poses_, ba_options, &optimized_poses);
+
+  if (optimized_poses.empty()) {
+    QMessageBox::warning(this,
+                         tr("LiDAR bundle adjustment"),
+                         tr("Optimization failed or returned no poses.\n"
+                            "Please check the log output."));
+    return;
+  }
+
+  lidar_poses_ = std::move(optimized_poses);
+
+  QMessageBox::information(this,
+                           tr("LiDAR bundle adjustment"),
+                           tr("Optimization finished.\n"
+                              "You can now use optimized LiDAR poses "
+                              "for further processing / visualization."));
 }
 
 }  // namespace colmap
